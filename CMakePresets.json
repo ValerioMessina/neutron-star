@@ -1,0 +1,26 @@
+{
+  "version": 6,
+  "configurePresets": [
+    {
+      "name": "metal-release",
+      "displayName": "Apple Metal Release",
+      "generator": "Unix Makefiles",
+      "binaryDir": "${sourceDir}/build",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Release", "NS_CUDA": "OFF" }
+    },
+    {
+      "name": "cuda-release",
+      "displayName": "NVIDIA CUDA Release",
+      "generator": "Unix Makefiles",
+      "binaryDir": "${sourceDir}/build-cuda",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Release", "NS_CUDA": "ON" }
+    }
+  ],
+  "buildPresets": [
+    { "name": "metal-release", "configurePreset": "metal-release", "jobs": 6 },
+    { "name": "cuda-release", "configurePreset": "cuda-release" }
+  ],
+  "testPresets": [
+    { "name": "metal-release", "configurePreset": "metal-release", "output": { "outputOnFailure": true } }
+  ]
+}

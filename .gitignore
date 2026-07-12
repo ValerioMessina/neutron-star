@@ -1,0 +1,6 @@
+/build/
+/build-*/
+/.cache/
+*.kv
+*.tmp
+.DS_Store
