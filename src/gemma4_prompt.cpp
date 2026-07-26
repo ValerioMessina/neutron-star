@@ -13,8 +13,10 @@ std::string extract_text_content(const nlohmann::json & content) {
     for (const auto & part : content) {
         const auto type = part.value("type", "text");
         if (type == "text" || type == "input_text") out += part.value("text", "");
-        else if (type == "image_url" || type == "input_image") out += "<|image|>";
-        else if (type == "input_audio") out += "<|audio|>";
+        else if (type == "image_url" || type == "input_image" ||
+                 type == "input_audio" || type == "input_video" ||
+                 type == "video_url" || type == "image" ||
+                 type == "audio" || type == "video") out += "<__media__>";
     }
     return out;
 }

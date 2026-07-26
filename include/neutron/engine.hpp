@@ -36,6 +36,11 @@ struct GenerationResult {
     GenerationStats stats;
 };
 
+struct MediaInput {
+    std::string type;
+    std::string source;
+};
+
 using TokenCallback = std::function<bool(const std::string &)>;
 
 class Engine {
@@ -44,11 +49,17 @@ public:
     virtual GenerationResult generate(const std::string & prompt,
                                       const SamplingParams & params,
                                       const TokenCallback & callback = {}) = 0;
+    virtual GenerationResult generate_multimodal(const std::string & prompt,
+                                                 const std::vector<MediaInput> & media,
+                                                 const SamplingParams & params,
+                                                 const TokenCallback & callback = {}) = 0;
+    virtual bool supports_media(const std::string & type) const = 0;
+    virtual std::string media_marker() const = 0;
     virtual std::string model_description() const = 0;
     virtual uint64_t model_size() const = 0;
     virtual uint32_t context_size() const = 0;
 };
 
-std::unique_ptr<Engine> make_llama_engine(const Config & config);
+std::unique_ptr<Engine> make_native_engine(const Config & config);
 
 } // namespace neutron

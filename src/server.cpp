@@ -76,6 +76,118 @@ json normalized_messages(const json & body) {
     return messages;
 }
 
+std::string media_data_url(const std::string & kind,
+                           const std::string & format,
+                           const std::string & data) {
+    if (data.rfind("data:", 0) == 0) return data;
+    std::string mime = format;
+    if (mime.empty()) {
+        mime = kind == "image" ? "image/png" :
+               kind == "audio" ? "audio/wav" : "video/mp4";
+    } else if (mime.find('/') == std::string::npos) {
+        mime = kind + "/" + mime;
+    }
+    return "data:" + mime + ";base64," + data;
+}
+
+std::string media_url(const json & value) {
+    if (value.is_string()) return value.get<std::string>();
+    if (!value.is_object()) return {};
+    for (const char * key : {
+             "url", "file_url", "file_data", "image_url", "video_url"
+         }) {
+        if (value.contains(key) && value[key].is_string()) {
+            return value[key].get<std::string>();
+        }
+    }
+    return {};
+}
+
+void collect_content_media(const json & content, std::vector<MediaInput> & out) {
+    if (!content.is_array()) return;
+    for (const auto & part : content) {
+        if (!part.is_object()) continue;
+        const std::string wire_type = part.value("type", "");
+        std::string type;
+        std::string source;
+        if (wire_type == "image_url") {
+            type = "image";
+            source = media_url(part.value("image_url", json()));
+        } else if (wire_type == "video_url") {
+            type = "video";
+            source = media_url(part.value("video_url", json()));
+        } else if (wire_type == "input_image" ||
+                   wire_type == "input_audio" ||
+                   wire_type == "input_video") {
+            type = wire_type.substr(6);
+            const json payload = part.contains(wire_type) ? part.at(wire_type) : part;
+            source = media_url(payload);
+            if (source.empty() && payload.is_object() &&
+                payload.contains("data") && payload["data"].is_string()) {
+                source = media_data_url(type, payload.value("format", ""),
+                                        payload["data"].get<std::string>());
+            }
+        } else if (wire_type == "image" ||
+                   wire_type == "audio" ||
+                   wire_type == "video") {
+            type = wire_type;
+            const json source_object = part.value("source", json());
+            source = media_url(source_object);
+            if (source.empty() && source_object.is_object() &&
+                source_object.contains("data") &&
+                source_object["data"].is_string()) {
+                source = media_data_url(
+                    type, source_object.value("media_type", ""),
+                    source_object["data"].get<std::string>());
+            }
+        }
+        if (!type.empty()) {
+            if (source.empty()) {
+                throw std::runtime_error(type + " input is missing a URL or base64 data");
+            }
+            out.push_back({type, std::move(source)});
+        }
+    }
+}
+
+std::vector<MediaInput> collect_media(const json & messages) {
+    std::vector<MediaInput> out;
+    if (!messages.is_array()) return out;
+    for (const auto & message : messages) {
+        if (message.is_object()) {
+            collect_content_media(message.value("content", json()), out);
+        }
+    }
+    return out;
+}
+
+std::string bind_media_marker(std::string prompt, const Engine & engine) {
+    static constexpr std::string_view placeholder = "<__media__>";
+    const std::string marker = engine.media_marker();
+    size_t pos = 0;
+    while ((pos = prompt.find(placeholder, pos)) != std::string::npos) {
+        prompt.replace(pos, placeholder.size(), marker);
+        pos += marker.size();
+    }
+    return prompt;
+}
+
+GenerationResult generate(Engine & engine,
+                          std::string prompt,
+                          const std::vector<MediaInput> & media,
+                          const SamplingParams & params,
+                          const TokenCallback & callback = {}) {
+    if (media.empty()) return engine.generate(prompt, params, callback);
+    for (const auto & item : media) {
+        if (!engine.supports_media(item.type)) {
+            throw std::runtime_error(
+                item.type + " input is not available; start with a compatible --mmproj");
+        }
+    }
+    return engine.generate_multimodal(
+        bind_media_marker(std::move(prompt), engine), media, params, callback);
+}
+
 json anthropic_messages(const json & body) {
     if (!body.contains("messages") || !body["messages"].is_array()) throw std::runtime_error("messages is required");
     json out = json::array();
@@ -90,7 +202,7 @@ json anthropic_messages(const json & body) {
         for (const auto & part : content) {
             const std::string type = part.value("type", "text");
             if (type == "text") text += part.value("text", "");
-            else if (type == "image") text += "<|image|>";
+            else if (type == "image" || type == "audio" || type == "video") text += "<__media__>";
             else if (type == "tool_use") {
                 const std::string call_id = part.value("id", "");
                 const std::string name = part.value("name", "");
@@ -213,7 +325,7 @@ void set_headers(httplib::Response & res, const std::string & request_id) {
 
 int run_server(const Config & config, Engine & engine) {
     httplib::Server server;
-    server.set_payload_max_length(8 * 1024 * 1024);
+    server.set_payload_max_length(256 * 1024 * 1024);
     server.set_read_timeout(30, 0);
     server.set_write_timeout(600, 0);
 
@@ -234,9 +346,14 @@ int run_server(const Config & config, Engine & engine) {
 
     server.Get("/healthz", [](const auto &, auto & res) { res.set_content("{\"status\":\"ok\"}", "application/json"); });
     server.Get("/v1/models", [&](const auto &, auto & res) {
+        json modalities = json::array({"text"});
+        for (const char * type : {"image", "audio", "video"}) {
+            if (engine.supports_media(type)) modalities.push_back(type);
+        }
         res.set_content(json{{"object", "list"}, {"data", json::array({{
             {"id", config.model_name}, {"object", "model"}, {"created", unix_time()}, {"owned_by", "local"},
-            {"context_length", engine.context_size()}, {"bytes", engine.model_size()}
+            {"context_length", engine.context_size()}, {"bytes", engine.model_size()},
+            {"input_modalities", modalities}
         }})}}.dump(), "application/json");
     });
     server.Get(R"(/v1/models/(.+))", [&](const httplib::Request &, auto & res) {
@@ -248,13 +365,14 @@ int run_server(const Config & config, Engine & engine) {
             const json body = json::parse(req.body);
             const auto params = sampling(body);
             const auto messages = normalized_messages(body);
+            const auto media = collect_media(messages);
             const json tools = body.value("tools", json::array());
             const bool thinking = body.value("thinking", false);
             const std::string prompt = render_gemma4_prompt(messages, tools, {.thinking = thinking});
             const std::string request_id = id("chatcmpl_");
             set_headers(res, request_id);
             if (!body.value("stream", false)) {
-                auto generated = engine.generate(prompt, params);
+                auto generated = generate(engine, prompt, media, params);
                 auto parsed = parse_output(generated.text);
                 json message = {{"role", "assistant"}, {"content", parsed.text}};
                 if (!parsed.calls.empty()) message["tool_calls"] = parsed.calls;
@@ -274,7 +392,7 @@ int run_server(const Config & config, Engine & engine) {
                 res.set_content(response.dump(), "application/json");
                 return;
             }
-            res.set_chunked_content_provider("text/event-stream", [&, prompt, params, tools, request_id](size_t, httplib::DataSink & sink) {
+            res.set_chunked_content_provider("text/event-stream", [&, prompt, media, params, tools, request_id](size_t, httplib::DataSink & sink) {
                 try {
                     const json first = {{"id", request_id}, {"object", "chat.completion.chunk"}, {"created", unix_time()},
                         {"model", config.model_name}, {"choices", json::array({{{"index", 0}, {"delta", {{"role", "assistant"}}}, {"finish_reason", nullptr}}})}};
@@ -285,7 +403,7 @@ int run_server(const Config & config, Engine & engine) {
                         return write(sink, sse({{"id", request_id}, {"object", "chat.completion.chunk"}, {"created", unix_time()},
                             {"model", config.model_name}, {"choices", json::array({{{"index", 0}, {"delta", {{"content", delta}}}, {"finish_reason", nullptr}}})}}));
                     });
-                    auto result = engine.generate(prompt, params, [&](const std::string & delta) { return visible.feed(delta); });
+                    auto result = generate(engine, prompt, media, params, [&](const std::string & delta) { return visible.feed(delta); });
                     visible.finish();
                     auto parsed = parse_output(result.text);
                     if (buffer_for_tools && !parsed.text.empty()) {
@@ -327,13 +445,14 @@ int run_server(const Config & config, Engine & engine) {
             else if (input.is_array()) for (const auto & item : input) messages.push_back(item);
             else throw std::runtime_error("input must be a string or array");
             const json response_tools = body.value("tools", json::array());
+            const auto media = collect_media(messages);
             const std::string prompt = render_gemma4_prompt(messages, response_tools);
             const auto params = sampling(body);
             const std::string rid = id("resp_");
             const std::string mid = id("msg_");
             if (body.value("stream", false)) {
                 set_headers(res, rid);
-                res.set_chunked_content_provider("text/event-stream", [&, prompt, params, response_tools, rid, mid](size_t, httplib::DataSink & sink) {
+                res.set_chunked_content_provider("text/event-stream", [&, prompt, media, params, response_tools, rid, mid](size_t, httplib::DataSink & sink) {
                     try {
                         json base = {{"id", rid}, {"object", "response"}, {"created_at", unix_time()}, {"status", "in_progress"}, {"model", config.model_name}, {"output", json::array()}};
                         write(sink, "event: response.created\n" + sse({{"type", "response.created"}, {"response", base}, {"sequence_number", 0}}));
@@ -343,8 +462,8 @@ int run_server(const Config & config, Engine & engine) {
                             return write(sink, "event: response.output_text.delta\n" + sse({{"type", "response.output_text.delta"}, {"item_id", mid}, {"output_index", 0}, {"content_index", 0}, {"delta", delta}}));
                         });
                         auto result = response_tools.empty()
-                            ? engine.generate(prompt, params, [&](const std::string & delta) { return visible.feed(delta); })
-                            : engine.generate(prompt, params);
+                            ? generate(engine, prompt, media, params, [&](const std::string & delta) { return visible.feed(delta); })
+                            : generate(engine, prompt, media, params);
                         visible.finish();
                         auto parsed = parse_output(result.text);
                         if (!response_tools.empty() && !parsed.text.empty()) visible.feed(parsed.text);
@@ -360,7 +479,7 @@ int run_server(const Config & config, Engine & engine) {
                 });
                 return;
             }
-            const auto result = engine.generate(prompt, params);
+            const auto result = generate(engine, prompt, media, params);
             auto parsed = parse_output(result.text);
             json output = json::array({{{"id", mid}, {"type", "message"}, {"role", "assistant"},
                 {"status", "completed"}, {"content", json::array({{{"type", "output_text"}, {"text", parsed.text}, {"annotations", json::array()}}})}}});
@@ -375,19 +494,20 @@ int run_server(const Config & config, Engine & engine) {
         try {
             const json body = json::parse(req.body);
             const auto params = sampling(body);
+            const auto media = collect_media(body.value("messages", json::array()));
             const std::string prompt = render_gemma4_prompt(anthropic_messages(body), body.value("tools", json::array()),
                 {.thinking = body.contains("thinking") && body["thinking"].value("type", "disabled") == "enabled"});
             const std::string mid = id("msg_");
             const bool has_tools = !body.value("tools", json::array()).empty();
             if (body.value("stream", false)) {
                 set_headers(res, mid);
-                res.set_chunked_content_provider("text/event-stream", [&, prompt, params, mid, has_tools](size_t, httplib::DataSink & sink) {
+                res.set_chunked_content_provider("text/event-stream", [&, prompt, media, params, mid, has_tools](size_t, httplib::DataSink & sink) {
                     try {
                         json message = {{"id", mid}, {"type", "message"}, {"role", "assistant"}, {"model", config.model_name},
                             {"content", json::array()}, {"stop_reason", nullptr}, {"stop_sequence", nullptr}, {"usage", {{"input_tokens", 0}, {"output_tokens", 0}}}};
                         write(sink, "event: message_start\n" + sse({{"type", "message_start"}, {"message", message}}));
                         if (has_tools) {
-                            auto result = engine.generate(prompt, params);
+                            auto result = generate(engine, prompt, media, params);
                             auto parsed = parse_output(result.text);
                             size_t index = 0;
                             if (!parsed.text.empty()) {
@@ -408,7 +528,7 @@ int run_server(const Config & config, Engine & engine) {
                         VisibleStream visible([&](const std::string & delta) {
                             return write(sink, "event: content_block_delta\n" + sse({{"type", "content_block_delta"}, {"index", 0}, {"delta", {{"type", "text_delta"}, {"text", delta}}}}));
                         });
-                        auto result = engine.generate(prompt, params, [&](const std::string & delta) { return visible.feed(delta); });
+                        auto result = generate(engine, prompt, media, params, [&](const std::string & delta) { return visible.feed(delta); });
                         visible.finish();
                         write(sink, "event: content_block_stop\n" + sse({{"type", "content_block_stop"}, {"index", 0}}));
                         write(sink, "event: message_delta\n" + sse({{"type", "message_delta"}, {"delta", {{"stop_reason", "end_turn"}, {"stop_sequence", nullptr}}}, {"usage", {{"output_tokens", result.stats.generated_tokens}}}}));
@@ -418,7 +538,7 @@ int run_server(const Config & config, Engine & engine) {
                 });
                 return;
             }
-            auto result = engine.generate(prompt, params);
+            auto result = generate(engine, prompt, media, params);
             auto parsed = parse_output(result.text);
             json content = json::array();
             if (!parsed.text.empty()) content.push_back({{"type", "text"}, {"text", parsed.text}});

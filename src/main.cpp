@@ -12,7 +12,7 @@ int main(int argc, char ** argv) {
             throw std::runtime_error("model file not found: " + config.model_path);
         }
         std::cerr << "loading " << config.model_path << "\n";
-        auto engine = neutron::make_llama_engine(config);
+        auto engine = neutron::make_native_engine(config);
         std::cerr << "model: " << engine->model_description() << "\n"
                   << "context: " << engine->context_size() << " tokens\n";
         return neutron::run_server(config, *engine);
